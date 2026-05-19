@@ -7,7 +7,7 @@ spring:
 
   ai:
     alibaba:
-      api-key: ${DASHSCOPE_API_KEY:sk-c1156be8719347dc821827048c85673f}
+      api-key: ${DASHSCOPE_API_KEY:sk-your-key}
       chat:
         options:
           model: qwen-plus
