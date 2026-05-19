@@ -56,7 +56,7 @@ public class DashScopeService {
 
             GenerationResult result = generation.call(param);
 
-            String response = result.getOutput().getChoices().get(0).getMessage().getContent();
+            String response = result.getOutput().getText();
 
             messages.add(Message.builder().role(Role.ASSISTANT.getValue()).content(response).build());
 
