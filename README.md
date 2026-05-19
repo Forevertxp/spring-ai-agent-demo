@@ -2,6 +2,8 @@
 
 基于阿里云DashScope SDK + Vue构建的门店数据分析智能体系统。
 
+博客文章：https://xpbyte.cn/archives/enterprise-ai-agent-for-store-analytics
+
 ## 架构特点
 
 ### 智能体编排流程（工具调用机制）
@@ -80,6 +82,8 @@ hxy-agent/
 ## 启动步骤
 
 ### 1. 启动后端
+
+替换application.yml中的key
 
 ```bash
 cd backend
