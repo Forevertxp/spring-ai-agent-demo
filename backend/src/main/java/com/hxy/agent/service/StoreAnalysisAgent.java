@@ -32,6 +32,7 @@ public class StoreAnalysisAgent {
     private final Generation generation;
     private final IntentRouter intentRouter;
     private final ToolRegistry toolRegistry;
+    private final AnalysisTemplateLibrary templateLibrary;
     private final ObjectMapper objectMapper;
 
     private final Map<String, List<Message>> sessionMessages = new HashMap<>();
@@ -39,10 +40,12 @@ public class StoreAnalysisAgent {
 
     public StoreAnalysisAgent(Generation generation,
                               IntentRouter intentRouter,
-                              ToolRegistry toolRegistry) {
+                              ToolRegistry toolRegistry,
+                              AnalysisTemplateLibrary templateLibrary) {
         this.generation = generation;
         this.intentRouter = intentRouter;
         this.toolRegistry = toolRegistry;
+        this.templateLibrary = templateLibrary;
         this.objectMapper = new ObjectMapper();
     }
 
@@ -52,6 +55,9 @@ public class StoreAnalysisAgent {
         // 1. 意图识别
         IntentResult intent = intentRouter.analyzeIntent(userQuery);
         log.info("意图识别结果: intent={}, confidence={}", intent.getIntent(), intent.getConfidence());
+
+        // 保存意图结果供后续使用
+        sessionIntentResults.put(sessionId, intent);
 
         // 2. 让AI决定需要调用哪些工具
         List<ToolCallRequest> toolCalls = determineToolCalls(sessionId, userQuery, intent);
@@ -96,6 +102,9 @@ public class StoreAnalysisAgent {
         // 1. 意图识别
         IntentResult intent = intentRouter.analyzeIntent(userQuery);
         log.info("意图识别: {}", intent.getIntent());
+
+        // 保存意图结果
+        sessionIntentResults.put(sessionId, intent);
 
         // 2. 决定工具调用
         List<ToolCallRequest> toolCalls = determineToolCalls(sessionId, userQuery, intent);
@@ -198,10 +207,8 @@ public class StoreAnalysisAgent {
 
             GenerationResult result = generation.call(param);
 
-            if (result != null && result.getOutput() != null &&
-                result.getOutput().getChoices() != null &&
-                !result.getOutput().getChoices().isEmpty()) {
-                return result.getOutput().getChoices().get(0).getMessage().getContent();
+            if (result != null && result.getOutput() != null) {
+                return result.getOutput().getText();
             }
 
             return "[]";
@@ -403,25 +410,40 @@ public class StoreAnalysisAgent {
     }
 
     private String generateFinalAnalysis(String sessionId, String userQuery, List<ToolCallResult> toolResults) {
+        // 获取意图信息
+        IntentResult intent = sessionIntentResults.getOrDefault(sessionId, IntentResult.unknown());
+
         // 构建包含工具结果的提示
-        String analysisPrompt = buildAnalysisPrompt(userQuery, toolResults);
+        String analysisPrompt = buildAnalysisPrompt(userQuery, toolResults, intent);
 
         // 调用AI生成最终分析
-        String analysis = callDashScopeForAnalysis(sessionId, analysisPrompt);
+        String analysis = callDashScopeForAnalysis(sessionId, analysisPrompt, intent);
 
         // 如果AI调用失败，使用fallback分析
         if (analysis == null || analysis.isEmpty() || analysis.contains("错误") || analysis.contains("失败")) {
             log.warn("AI分析失败或返回空，使用fallback分析");
-            analysis = buildFallbackAnalysis(toolResults);
+            analysis = buildFallbackAnalysis(toolResults, intent);
         }
 
         return analysis;
     }
 
-    private String buildAnalysisPrompt(String userQuery, List<ToolCallResult> toolResults) {
+    // 存储意图结果用于后续分析
+    private final Map<String, IntentResult> sessionIntentResults = new HashMap<>();
+
+    private String buildAnalysisPrompt(String userQuery, List<ToolCallResult> toolResults, IntentResult intent) {
         StringBuilder prompt = new StringBuilder();
         prompt.append("用户问题: ").append(userQuery).append("\n\n");
-        prompt.append("工具调用结果:\n\n");
+        prompt.append("已识别意图: ").append(intent.getIntent()).append("\n");
+        prompt.append("置信度: ").append(intent.getConfidence()).append("\n\n");
+
+        // 根据意图选择分析模板
+        String templatePrompt = selectTemplateByIntent(intent);
+        if (!templatePrompt.isEmpty()) {
+            prompt.append("## 分析框架\n").append(templatePrompt).append("\n\n");
+        }
+
+        prompt.append("## 工具调用结果\n\n");
 
         for (ToolCallResult result : toolResults) {
             prompt.append("### 工具: ").append(result.getToolName()).append("\n");
@@ -435,18 +457,39 @@ public class StoreAnalysisAgent {
         }
 
         prompt.append("""
-                请基于以上工具返回的数据，进行专业分析，给出见解和建议。
-
-                ## 分析要求
-                1. 使用Markdown格式输出
-                2. 包含数据概览表格
-                3. 给出分析结论
-                4. 提供改进建议
-                5. 对比行业基准数据(月营收50-80万，利润率15-20%)
+                ## 分析输出要求
+                1. 严格按照上述分析框架的结构组织内容
+                2. 每个分析部分都要有具体数据支撑，引用工具返回的数据
+                3. 使用Markdown格式，包含数据表格和可视化建议
+                4. 给出明确的分析结论，指出关键发现
+                5. 提供优先级排序的改进建议，建议要具体可行
+                6. 对比行业基准数据时，明确说明基准值和差距
 
                 """);
 
         return prompt.toString();
+    }
+
+    private String selectTemplateByIntent(IntentResult intent) {
+        switch (intent.getIntent()) {
+            case DATA_QUERY:
+                // 简单数据查询用财务健康度模板
+                return templateLibrary.getTemplatePrompt("financial_health");
+            case COMPARISON:
+                // 对比分析使用综合模板
+                return templateLibrary.getTemplatePrompt("comprehensive");
+            case TREND_ANALYSIS:
+                // 趋势分析重点关注财务表现
+                return templateLibrary.getTemplatePrompt("financial_health");
+            case ANOMALY_DIAG:
+                // 异常诊断使用综合模板全面检查
+                return templateLibrary.getTemplatePrompt("comprehensive");
+            case RECOMMENDATION:
+                // 建议请求使用客流分析或财务健康度模板
+                return templateLibrary.getTemplatePrompt("customer_flow");
+            default:
+                return templateLibrary.getTemplatePrompt("comprehensive");
+        }
     }
 
     private String formatToolResult(Object result) {
@@ -457,28 +500,14 @@ public class StoreAnalysisAgent {
         }
     }
 
-    private String callDashScopeForAnalysis(String sessionId, String prompt) {
+    private String callDashScopeForAnalysis(String sessionId, String prompt, IntentResult intent) {
         try {
             List<Message> messages = sessionMessages.computeIfAbsent(sessionId, k -> new ArrayList<>());
 
             if (messages.isEmpty()) {
-                messages.add(Message.builder().role("system").content("""
-                        你是门店经营数据分析智能体。
-
-                        ## 分析原则
-                        - 基于数据说话，不主观臆断
-                        - 对比要有参照（行业均值、历史数据）
-                        - 发现异常要深入分析原因
-                        - 建议要具体可行，有优先级
-
-                        ## 行业基准数据
-                        - 月营收基准：一线城市50-80万
-                        - 利润率基准：15-20%为正常水平
-                        - 客流转化率基准：20-30%
-                        - 库存周转率基准：4-6次/年
-
-                        请使用Markdown格式输出分析报告。
-                        """).build());
+                // 根据意图构建更专业的系统提示
+                String systemPrompt = buildSystemPromptByIntent(intent);
+                messages.add(Message.builder().role("system").content(systemPrompt).build());
             }
 
             messages.add(Message.builder().role("user").content(prompt).build());
@@ -502,26 +531,92 @@ public class StoreAnalysisAgent {
                 return response;
             }
 
-            return buildFallbackAnalysis(sessionToolResults.getOrDefault(sessionId, new ArrayList<>()));
+            return buildFallbackAnalysis(sessionToolResults.getOrDefault(sessionId, new ArrayList<>()), intent);
 
         } catch (Exception e) {
             log.error("分析调用失败: {}", e.getMessage());
-            return buildFallbackAnalysis(sessionToolResults.getOrDefault(sessionId, new ArrayList<>()));
+            return buildFallbackAnalysis(sessionToolResults.getOrDefault(sessionId, new ArrayList<>()), intent);
+        }
+    }
+
+    private String buildSystemPromptByIntent(IntentResult intent) {
+        String basePrompt = """
+                你是门店经营数据分析智能体，专注于为门店管理者提供专业的数据分析和决策支持。
+
+                ## 分析原则
+                - 基于数据说话，不主观臆断，所有结论要有数据支撑
+                - 对比要有参照（行业均值、历史数据、同类门店）
+                - 发现异常要深入分析原因，提出诊断思路
+                - 建议要具体可行，有优先级排序，便于执行落地
+
+                ## 行业基准数据
+                - 月营收基准：一线城市50-80万，二线城市30-50万
+                - 利润率基准：15-20%为正常水平，>20%优秀，<15%需关注
+                - 客流转化率基准：20-30%
+                - 库存周转率基准：4-6次/年
+
+                ## 输出格式
+                使用Markdown格式，结构清晰，包含：
+                - 数据概览表格
+                - 分析结论（关键发现）
+                - 问题诊断（如有异常）
+                - 改进建议（按优先级排序）
+                """;
+
+        // 根据不同意图添加特定指导
+        switch (intent.getIntent()) {
+            case COMPARISON:
+                return basePrompt + """
+
+                        ## 对比分析专项要求
+                        - 明确对比维度（门店、时段、指标）
+                        - 计算差距百分比，量化差异程度
+                        - 分析差异原因，提供解释
+                        - 给出对标建议，如何缩小差距或保持优势
+                        """;
+            case TREND_ANALYSIS:
+                return basePrompt + """
+
+                        ## 趋势分析专项要求
+                        - 标注关键转折点和异常波动
+                        - 计算环比/同比变化率
+                        - 分析趋势驱动因素
+                        - 预测未来走势并给出应对建议
+                        """;
+            case ANOMALY_DIAG:
+                return basePrompt + """
+
+                        ## 异常诊断专项要求
+                        - 精准定位异常指标和发生时间
+                        - 分析异常的可能原因（内部因素、外部因素）
+                        - 评估异常的影响范围和程度
+                        - 提出排查方向和纠正措施
+                        """;
+            case RECOMMENDATION:
+                return basePrompt + """
+
+                        ## 建议生成专项要求
+                        - 建议基于数据分析，不凭空提出
+                        - 每条建议说明预期效果和实施难度
+                        - 建议按ROI排序，优先推荐高收益低成本方案
+                        - 提供实施步骤和注意事项
+                        """;
+            default:
+                return basePrompt;
         }
     }
 
     private Flux<String> streamFinalAnalysis(String sessionId, String userQuery, List<ToolCallResult> toolResults) {
-        String analysisPrompt = buildAnalysisPrompt(userQuery, toolResults);
+        IntentResult intent = sessionIntentResults.getOrDefault(sessionId, IntentResult.unknown());
+        String analysisPrompt = buildAnalysisPrompt(userQuery, toolResults, intent);
 
         return Flux.create(emitter -> {
             try {
                 List<Message> messages = sessionMessages.computeIfAbsent(sessionId, k -> new ArrayList<>());
 
                 if (messages.isEmpty()) {
-                    messages.add(Message.builder().role("system").content("""
-                            你是门店经营数据分析智能体。
-                            基于数据进行分析，使用Markdown格式输出。
-                            """).build());
+                    String systemPrompt = buildSystemPromptByIntent(intent);
+                    messages.add(Message.builder().role("system").content(systemPrompt).build());
                 }
 
                 messages.add(Message.builder().role("user").content(analysisPrompt).build());
@@ -574,7 +669,7 @@ public class StoreAnalysisAgent {
         });
     }
 
-    private String buildFallbackAnalysis(List<ToolCallResult> results) {
+    private String buildFallbackAnalysis(List<ToolCallResult> results, IntentResult intent) {
         log.info("buildFallbackAnalysis: results.size={}", results != null ? results.size() : 0);
 
         if (results == null || results.isEmpty()) {
@@ -582,7 +677,19 @@ public class StoreAnalysisAgent {
         }
 
         StringBuilder analysis = new StringBuilder();
-        analysis.append("## 数据分析报告\n\n");
+
+        // 根据意图选择模板标题和结构
+        String templateName = mapIntentToTemplateName(intent);
+        AnalysisTemplateLibrary.AnalysisTemplate template = templateLibrary.getTemplate(templateName);
+
+        if (template != null) {
+            analysis.append("## ").append(template.getName()).append("\n\n");
+        } else {
+            analysis.append("## 数据分析报告\n\n");
+        }
+
+        // 数据概览部分
+        analysis.append("### 数据概览\n\n");
 
         for (ToolCallResult result : results) {
             log.info("处理工具结果: tool={}, success={}, resultType={}",
@@ -590,9 +697,7 @@ public class StoreAnalysisAgent {
                     result.getResult() != null ? result.getResult().getClass().getSimpleName() : "null");
 
             if (!result.isSuccess()) {
-                analysis.append("### 工具调用失败\n");
-                analysis.append("工具: ").append(result.getToolName()).append("\n");
-                analysis.append("错误: ").append(result.getErrorMessage()).append("\n\n");
+                analysis.append("**工具调用失败**: ").append(result.getToolName()).append(" - ").append(result.getErrorMessage()).append("\n\n");
                 continue;
             }
 
@@ -605,28 +710,14 @@ public class StoreAnalysisAgent {
             // 处理单个财务数据
             if (data instanceof FinancialData) {
                 FinancialData f = (FinancialData) data;
-                analysis.append("### 财务数据\n\n");
-                analysis.append("| 指标 | 数值 |\n|------|------|\n");
-                analysis.append(String.format("| 门店 | %s |\n", f.getStoreName()));
-                analysis.append(String.format("| 营收 | %.2f万元 |\n", f.getRevenue() / 10000));
-                analysis.append(String.format("| 利润 | %.2f万元 |\n", f.getProfit() / 10000));
-                analysis.append(String.format("| 成本 | %.2f万元 |\n", f.getCost() / 10000));
-                analysis.append(String.format("| 利润率 | %.2f%% |\n\n", f.getProfitMargin()));
-
-                // 添加分析结论
-                analysis.append("### 分析结论\n\n");
-                if (f.getProfitMargin() >= 18) {
-                    analysis.append("门店利润率表现优秀，高于行业平均水平(15-20%)。\n\n");
-                } else if (f.getProfitMargin() >= 15) {
-                    analysis.append("门店利润率处于正常水平，符合行业基准。\n\n");
-                } else {
-                    analysis.append("门店利润率低于行业基准，需要关注成本控制和运营效率。\n\n");
-                }
-
-                analysis.append("### 改进建议\n\n");
-                analysis.append("1. 持续监控营收和利润变化\n");
-                analysis.append("2. 优化成本结构，提升利润率\n");
-                analysis.append("3. 加强客流运营，提升转化率\n");
+                analysis.append("| 指标 | 数值 | 行业基准 | 状态 |\n|------|------|----------|------|\n");
+                analysis.append(String.format("| 门店 | %s | - | - |\n", f.getStoreName()));
+                analysis.append(String.format("| 营收 | %.2f万元 | 50-80万 | %s |\n", f.getRevenue() / 10000,
+                        f.getRevenue() >= 500000 ? "✅ 正常" : "⚠️ 需关注"));
+                analysis.append(String.format("| 利润 | %.2f万元 | - | - |\n", f.getProfit() / 10000));
+                analysis.append(String.format("| 成本 | %.2f万元 | - | - |\n", f.getCost() / 10000));
+                analysis.append(String.format("| 利润率 | %.2f%% | 15-20%% | %s |\n\n", f.getProfitMargin(),
+                        f.getProfitMargin() >= 20 ? "✅ 优秀" : (f.getProfitMargin() >= 15 ? "✅ 正常" : "⚠️ 需关注")));
             }
 
             // 处理财务数据列表（对比或趋势）
@@ -637,24 +728,22 @@ public class StoreAnalysisAgent {
                     @SuppressWarnings("unchecked")
                     List<FinancialData> dataList = (List<FinancialData>) list;
 
-                    analysis.append("### 对比数据\n\n");
-                    analysis.append("| 门店 | 营收 | 利润 | 利润率 |\n|------|------|------|--------|\n");
-                    for (FinancialData f : dataList) {
-                        analysis.append(String.format("| %s | %.2f万 | %.2f万 | %.2f%% |\n",
-                                f.getStoreName(), f.getRevenue() / 10000, f.getProfit() / 10000, f.getProfitMargin()));
+                    if (result.getToolName().equals("get_financial_trend")) {
+                        analysis.append("### 趋势数据\n\n");
+                        analysis.append("| 时间 | 营收 | 利润 | 利润率 |\n|------|------|------|--------|\n");
+                        for (FinancialData f : dataList) {
+                            analysis.append(String.format("| %s | %.2f万 | %.2f万 | %.2f%% |\n",
+                                    f.getTimeRange(), f.getRevenue() / 10000, f.getProfit() / 10000, f.getProfitMargin()));
+                        }
+                    } else {
+                        analysis.append("### 对比数据\n\n");
+                        analysis.append("| 门店 | 营收 | 利润 | 利润率 |\n|------|------|------|--------|\n");
+                        for (FinancialData f : dataList) {
+                            analysis.append(String.format("| %s | %.2f万 | %.2f万 | %.2f%% |\n",
+                                    f.getStoreName(), f.getRevenue() / 10000, f.getProfit() / 10000, f.getProfitMargin()));
+                        }
                     }
                     analysis.append("\n");
-
-                    // 对比分析结论
-                    if (dataList.size() >= 2) {
-                        FinancialData first = dataList.get(0);
-                        FinancialData second = dataList.get(1);
-                        analysis.append("### 对比分析\n\n");
-                        analysis.append(String.format("%s营收%.2f万，%s营收%.2f万，差距%.2f万。\n\n",
-                                first.getStoreName(), first.getRevenue() / 10000,
-                                second.getStoreName(), second.getRevenue() / 10000,
-                                Math.abs(first.getRevenue() - second.getRevenue()) / 10000));
-                    }
                 }
             }
 
@@ -662,16 +751,136 @@ public class StoreAnalysisAgent {
             if (data instanceof InventoryStatus) {
                 InventoryStatus inv = (InventoryStatus) data;
                 analysis.append("### 库存状态\n\n");
-                analysis.append("| 指标 | 数值 |\n|------|------|\n");
-                analysis.append(String.format("| 总商品数 | %d |\n", inv.getTotalItems()));
-                analysis.append(String.format("| 周转率 | %.2f次/年 |\n", inv.getTurnoverRate()));
-                analysis.append(String.format("| 低库存商品 | %d |\n", inv.getLowStockItems()));
-                analysis.append("\n");
+                analysis.append("| 指标 | 数值 | 行业基准 | 状态 |\n|------|------|----------|------|\n");
+                analysis.append(String.format("| 总商品数 | %d | - | - |\n", inv.getTotalItems()));
+                analysis.append(String.format("| 周转率 | %.2f次/年 | 4-6次 | %s |\n", inv.getTurnoverRate(),
+                        inv.getTurnoverRate() >= 4 && inv.getTurnoverRate() <= 6 ? "✅ 正常" : "⚠️ 需关注"));
+                analysis.append(String.format("| 低库存商品 | %d | <5 | %s |\n\n", inv.getLowStockItems(),
+                        inv.getLowStockItems() < 5 ? "✅ 正常" : "⚠️ 需补货"));
             }
         }
 
+        // 分析结论部分
+        analysis.append("### 分析结论\n\n");
+        analysis.append(generateAnalysisConclusion(results, intent));
+
+        // 改进建议部分
+        analysis.append("### 改进建议\n\n");
+        analysis.append(generateSuggestions(results, intent));
+
         log.info("fallback分析完成，长度: {}", analysis.length());
         return analysis.toString();
+    }
+
+    private String mapIntentToTemplateName(IntentResult intent) {
+        switch (intent.getIntent()) {
+            case DATA_QUERY:
+            case TREND_ANALYSIS:
+                return "financial_health";
+            case COMPARISON:
+                return "comprehensive";
+            case ANOMALY_DIAG:
+                return "comprehensive";
+            case RECOMMENDATION:
+                return "customer_flow";
+            default:
+                return "comprehensive";
+        }
+    }
+
+    private String generateAnalysisConclusion(List<ToolCallResult> results, IntentResult intent) {
+        StringBuilder conclusion = new StringBuilder();
+
+        for (ToolCallResult result : results) {
+            if (!result.isSuccess() || result.getResult() == null) continue;
+
+            Object data = result.getResult();
+            if (data instanceof FinancialData) {
+                FinancialData f = (FinancialData) data;
+
+                switch (intent.getIntent()) {
+                    case COMPARISON:
+                        conclusion.append(String.format("- %s营收%.2f万元，利润率%.2f%%\n",
+                                f.getStoreName(), f.getRevenue() / 10000, f.getProfitMargin()));
+                        break;
+                    case TREND_ANALYSIS:
+                        conclusion.append(String.format("- %s时段营收%.2f万元，环比变化需进一步分析\n",
+                                f.getTimeRange() != null ? f.getTimeRange() : "当前", f.getRevenue() / 10000));
+                        break;
+                    case ANOMALY_DIAG:
+                        if (f.getProfitMargin() < 15) {
+                            conclusion.append("- **异常发现**: 利润率低于行业基准(15-20%)，需关注成本结构\n");
+                        }
+                        if (f.getRevenue() < 500000) {
+                            conclusion.append("- **异常发现**: 营收低于行业基准(50万)，需分析客流和转化率\n");
+                        }
+                        break;
+                    default:
+                        if (f.getProfitMargin() >= 18) {
+                            conclusion.append("- 门店利润率表现优秀，高于行业平均水平\n");
+                        } else if (f.getProfitMargin() >= 15) {
+                            conclusion.append("- 门店利润率处于正常水平，符合行业基准\n");
+                        } else {
+                            conclusion.append("- 门店利润率低于行业基准，需要关注成本控制\n");
+                        }
+                }
+            }
+
+            if (data instanceof InventoryStatus) {
+                InventoryStatus inv = (InventoryStatus) data;
+                if (inv.getLowStockItems() > 5) {
+                    conclusion.append("- 库存预警: 有" + inv.getLowStockItems() + "个商品库存不足，需及时补货\n");
+                }
+            }
+        }
+
+        if (conclusion.length() == 0) {
+            conclusion.append("- 数据已获取，请结合具体指标进行分析\n");
+        }
+
+        return conclusion.toString();
+    }
+
+    private String generateSuggestions(List<ToolCallResult> results, IntentResult intent) {
+        StringBuilder suggestions = new StringBuilder();
+
+        boolean hasLowProfit = false;
+        boolean hasLowRevenue = false;
+        boolean hasLowStock = false;
+
+        for (ToolCallResult result : results) {
+            if (!result.isSuccess() || result.getResult() == null) continue;
+
+            Object data = result.getResult();
+            if (data instanceof FinancialData) {
+                FinancialData f = (FinancialData) data;
+                if (f.getProfitMargin() < 15) hasLowProfit = true;
+                if (f.getRevenue() < 500000) hasLowRevenue = true;
+            }
+            if (data instanceof InventoryStatus) {
+                InventoryStatus inv = (InventoryStatus) data;
+                if (inv.getLowStockItems() > 5) hasLowStock = true;
+            }
+        }
+
+        // 按优先级排序建议
+        int priority = 1;
+        if (hasLowProfit) {
+            suggestions.append(priority++ + ". **优先**: 分析成本结构，找出可控成本项进行优化\n");
+        }
+        if (hasLowRevenue) {
+            suggestions.append(priority++ + ". **优先**: 制定客流提升计划，加强门店引流活动\n");
+        }
+        if (hasLowStock) {
+            suggestions.append(priority++ + ". **紧急**: 立即补货低库存商品，避免缺货影响销售\n");
+        }
+
+        // 通用建议
+        suggestions.append(priority++ + ". 持续监控关键指标，建立周报/月报分析机制\n");
+        suggestions.append(priority++ + ". 对比同类门店数据，找出差距和学习标杆\n");
+        suggestions.append(priority + ". 定期盘点库存，优化商品结构提升周转效率\n");
+
+        return suggestions.toString();
     }
 
     private List<ChartConfig> extractChartsFromToolResults(List<ToolCallResult> results) {
