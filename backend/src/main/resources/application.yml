@@ -1,0 +1,36 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: store-agent
+
+  ai:
+    alibaba:
+      api-key: ${DASHSCOPE_API_KEY:sk-c1156be8719347dc821827048c85673f}
+      chat:
+        options:
+          model: qwen-plus
+          temperature: 0.7
+
+# 日志配置
+logging:
+  level:
+    com.hxy.agent: DEBUG
+    org.springframework.ai: DEBUG
+
+# 门店配置
+store:
+  list:
+    - code: BJ001
+      name: 北京王府井店
+      city: 北京
+    - code: SH001
+      name: 上海南京路店
+      city: 上海
+    - code: GZ001
+      name: 广州天河店
+      city: 广州
+    - code: SZ001
+      name: 圳福田店
+      city: 深圳
